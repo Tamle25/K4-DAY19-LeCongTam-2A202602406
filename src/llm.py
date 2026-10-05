@@ -17,13 +17,17 @@ import time
 from dataclasses import dataclass, fields
 from typing import Any
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 PROVIDERS = {
     "openai": {"key": "OPENAI_API_KEY", "base_url": None,
                "chat": "gpt-4o-mini", "embed": "text-embedding-3-small"},
     "openrouter": {"key": "OPENROUTER_API_KEY", "base_url": "https://openrouter.ai/api/v1",
                    "chat": "openai/gpt-4o-mini", "embed": "openai/text-embedding-3-small"},
     "gemini": {"key": "GEMINI_API_KEY", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-               "chat": "gemini-2.5-flash-lite", "embed": "gemini-embedding-001"},
+               "chat": "gemini-3.5-flash-lite", "embed": "gemini-embedding-001"},
     "anthropic": {"key": "ANTHROPIC_API_KEY", "base_url": None,
                   "chat": "claude-opus-5-5", "embed": None},
 }
@@ -37,6 +41,7 @@ PRICES_PER_M = {
     "text-embedding-3-small": (0.02, 0.0),
     "text-embedding-3-large": (0.13, 0.0),
     "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-3.5-flash-lite": (0.10, 0.40),
     # Gemini embedding pricing intentionally omitted: the current pricing page does not list gemini-embedding-001.
     "claude-opus-5-5": (4.00, 20.00),
     "claude-sonnet-5-5": (2.00, 10.00),
@@ -119,19 +124,29 @@ class MeteredLLM:
         if self.chat_provider == "anthropic":
             text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
         else:
-            if json_mode and self.chat_provider != "gemini":
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                    response_format={"type": "json_object"},
-                )
-            else:
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                )
+            max_attempts = 6
+            for attempt in range(max_attempts):
+                try:
+                    if json_mode and self.chat_provider != "gemini":
+                        response = self._chat_client.chat.completions.create(
+                            model=self.chat_model_id,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0,
+                            response_format={"type": "json_object"},
+                        )
+                    else:
+                        response = self._chat_client.chat.completions.create(
+                            model=self.chat_model_id,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0,
+                        )
+                    break
+                except Exception as e:
+                    err_msg = str(e)
+                    if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "RateLimit" in type(e).__name__) and attempt < max_attempts - 1:
+                        time.sleep(5 * (attempt + 1))
+                    else:
+                        raise
             text, model = response.choices[0].message.content or "", self.chat_model_id
             usage = response.usage
             tokens_in = usage.prompt_tokens if usage else 0
@@ -158,7 +173,17 @@ class MeteredLLM:
 
     def embed(self, text: str) -> list[float]:
         start = time.perf_counter()
-        response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+        max_attempts = 6
+        for attempt in range(max_attempts):
+            try:
+                response = self._embed_client.embeddings.create(model=self.embed_model_id, input=text)
+                break
+            except Exception as e:
+                err_msg = str(e)
+                if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "RateLimit" in type(e).__name__) and attempt < max_attempts - 1:
+                    time.sleep(5 * (attempt + 1))
+                else:
+                    raise
         tokens = getattr(response.usage, "prompt_tokens", 0) or 0   # some OpenAI-compatible APIs omit usage
         self.usage += Usage(1, tokens, 0, price(self.embed_model_id, tokens), time.perf_counter() - start)
         return [float(value) for value in response.data[0].embedding]
